@@ -6,6 +6,9 @@
 когда достигнут max_steps (защита от бесконечных циклов и неконтролируемых расходов),
 когда модель зациклилась на одном и том же вызове или когда пользователь нажал Ctrl+C.
 В двух последних случаях история остаётся корректной: на каждый вызов есть результат.
+
+Вокруг цикла: хуки (hooks.py), контекст проекта (project.py: CLAUDE.md и навыки в системном промпте)
+и управление историей: clear() сбрасывает её, compact() заменяет пересказом.
 """
 import json
 import time
@@ -14,7 +17,9 @@ from pathlib import Path
 
 import tools
 import ui
+from hooks import Hooks
 from llm import LLM
+from project import Project
 
 SYSTEM_PROMPT = """You are a coding assistant working inside a workspace directory.
 - Explore before editing: use glob/grep to find files and read_file to understand them.
@@ -25,6 +30,8 @@ SYSTEM_PROMPT = """You are a coding assistant working inside a workspace directo
   Write all text for the user in the language of the user's request.
 - If a call fails or gets blocked, change your approach instead of repeating the same call.
 - When the task is done, stop and reply with a brief summary of what you changed."""
+
+COMPACT_ACK = "Understood. I have the summary of the earlier conversation and will continue from it."
 
 REPEAT_BLOCK = 3  # столько одинаковых вызовов подряд: третий не выполняется, модель получает подсказку сменить подход
 REPEAT_STOP = 5   # а на пятом цикл останавливается
@@ -40,9 +47,15 @@ def find_latest_log(log_dir: Path = Path("logs")) -> Path | None:
 
 class Agent:
     def __init__(self, llm: LLM, workspace: Path, auto_yes: bool = False,
-                 max_steps: int = 25, log_dir: Path = Path("logs")):
+                 max_steps: int = 25, log_dir: Path = Path("logs"),
+                 project: Project | None = None, hooks: Hooks | None = None):
         self.llm = llm
         self.workspace = workspace.resolve()
+        self.project = project or Project()
+        self.hooks = hooks or Hooks([], self.workspace)
+        self.system = self.project.system_prompt(SYSTEM_PROMPT)  # + навыки и CLAUDE.md
+        # use_skill имеет смысл, только если есть навыки: иначе не показываем его модели
+        self.schemas = [s for s in tools.SCHEMAS if self.project.skills or s["name"] != "use_skill"]
         self.auto_yes = auto_yes
         self.max_steps = max_steps
         self.history: list = []  # непрозрачные сообщения провайдера; сохраняются между задачами в одной сессии REPL
@@ -62,7 +75,7 @@ class Agent:
 
     def resume(self, path: Path) -> int:
         """Восстановить историю из JSONL-лога и продолжить писать в тот же файл. Возвращает число сообщений."""
-        messages = []
+        messages, seen = [], False
         for line in path.read_text(encoding="utf-8").splitlines():
             try:
                 event = json.loads(line)
@@ -70,7 +83,10 @@ class Agent:
                 continue  # оборванная последняя строка после аварийного завершения
             if event.get("event") == "message":
                 messages.append(self.llm.load_message(event["data"]))
-        if not messages:
+                seen = True
+            elif event.get("event") == "reset":  # /clear или /compact: всё до этой точки в историю не входит
+                messages = []
+        if not seen:
             raise ValueError(f"в {path} нет сообщений модели (лог старого формата?): восстановить нечего")
         self.history = messages
         self.log_path = path
@@ -80,6 +96,62 @@ class Agent:
             self._close_turn(dangling, [], "session was interrupted before this call ran",
                              "[session was interrupted]")
         return len(messages)
+
+    # --- управление историей (/clear, /compact) ---
+
+    def clear(self) -> None:
+        """Начать разговор с чистого листа. Файл лога тот же; событие reset говорит --resume забыть прошлое."""
+        self.history = []
+        self._log("reset", reason="clear")
+
+    def compact(self, instructions: str = "") -> bool:
+        """Заменить историю пересказом, сделанным моделью. Возвращает True, если сжатие удалось.
+
+        До успешного ответа модели история не трогается, поэтому ошибка API или Ctrl+C ничего не ломают.
+        Новая история: пересказ как реплика пользователя + подтверждение модели (роли чередуются).
+        """
+        if not self.history:
+            ui.info("История пуста: сжимать нечего.")
+            return False
+        before = len(self.history)
+        try:
+            summary = self.llm.summarize(self.history, instructions)
+        except KeyboardInterrupt:
+            ui.error("Сжатие прервано, история не изменена.")
+            return False
+        except Exception as e:
+            msg = f"Сжатие не удалось, история не изменена: {type(e).__name__}: {e}"
+            self._log("llm_error", step=0, error=msg)
+            ui.error(msg)
+            return False
+        self.history = []
+        self._log("reset", reason="compact")
+        self._add(self.llm.user_message("Summary of the earlier conversation (the full history was compacted):\n\n"
+                                        + summary))
+        self._add(self.llm.model_message(COMPACT_ACK))
+        ui.info(f"История сжата: {before} сообщений -> {len(self.history)}, пересказ {len(summary)} символов.")
+        return True
+
+    # --- хуки ---
+
+    def _run_hooks(self, event: str, payload: dict, tool_name: str | None = None) -> tuple[str | None, str]:
+        """Выполнить хуки события. Возвращает (причина блокировки или None, stdout успешных хуков)."""
+        block, out = None, []
+        for hook, res in self.hooks.run(event, payload, tool_name):
+            self._log("hook", hook_event=event, command=hook.command, exit_code=res.exit_code,
+                      timed_out=res.timed_out, stdout=res.stdout, stderr=res.stderr)
+            if res.blocked:
+                block = res.stderr.strip() or "(hook gave no reason)"
+                ui.hook(event, hook.command, f"блокировка: {block}", failed=True)
+            elif res.ok:
+                if res.stdout.strip():
+                    out.append(res.stdout.strip())
+                    ui.hook(event, hook.command, res.stdout.strip())
+            else:
+                why = "таймаут" if res.timed_out else f"код выхода {res.exit_code}"
+                ui.hook(event, hook.command, f"{why} (работа продолжается)" + (f": {res.stderr.strip()}" if res.stderr.strip() else ""),
+                        failed=True)
+        return block, "\n".join(out)
 
     def _close_turn(self, calls: list, results: list, reason: str, note: str) -> None:
         """Закрыть ход так, чтобы история осталась валидной: ответ на КАЖДЫЙ вызов + сообщение модели.
@@ -110,16 +182,26 @@ class Agent:
         return input(ui.confirm_request(name, args)).strip().lower() in ("y", "yes", "д", "да")
 
     def run(self, task: str) -> str:
-        self._add(self.llm.user_message(task))
+        try:
+            block, context = self._run_hooks("UserPromptSubmit", {"prompt": task})
+        except KeyboardInterrupt:  # задача ещё не в истории: отменять нечего
+            return self._cancelled_outside_turn()
+        if block:  # задача не попадает ни в историю, ни к модели
+            msg = f"Задача заблокирована хуком UserPromptSubmit: {block}"
+            self._log("task_blocked", task=task, reason=block)
+            ui.error(msg)
+            return msg
+        self._add(self.llm.user_message(task + (f"\n\n[Context from UserPromptSubmit hook]\n{context}" if context else "")))
         self._log("task", task=task)
 
         pending: list | None = None  # вызовы хода, для которых tool_results ещё не в истории (нужно при Ctrl+C)
         results: list = []
         last_sig, repeat = None, 0   # защита от зацикливания: сколько раз подряд один и тот же вызов
+        stop_hook_used = False       # Stop-хук может вернуть модель к работе только один раз за задачу
         try:
             for step in range(1, self.max_steps + 1):
                 try:
-                    reply = self.llm.generate(self.history, SYSTEM_PROMPT, tools.SCHEMAS)
+                    reply = self.llm.generate(self.history, self.system, self.schemas)
                 except Exception as e:  # API не ответил даже после повторов: сообщаем и не роняем REPL
                     msg = f"Вызов LLM не удался: {type(e).__name__}: {e}"
                     self._log("llm_error", step=step, error=msg)
@@ -134,6 +216,15 @@ class Agent:
                           tool_calls=[{"name": c.name, "args": c.args} for c in reply.tool_calls])
 
                 if not reply.tool_calls:  # обычный текст = модель считает задачу выполненной
+                    if not stop_hook_used:
+                        try:
+                            block, _ = self._run_hooks("Stop", {"last_assistant_message": reply.text})
+                        except KeyboardInterrupt:  # ответ модели уже в истории: _close_turn дал бы две реплики модели подряд
+                            return self._cancelled_outside_turn()
+                        if block:  # хук не согласен с завершением: его сообщение модели, работа продолжается
+                            stop_hook_used = True
+                            self._add(self.llm.user_message(f"[Stop hook] {block}"))
+                            continue
                     return reply.text
 
                 pending, results = reply.tool_calls, []
@@ -153,8 +244,14 @@ class Agent:
                         result = {"ok": False, "error": f"this exact call was already made {repeat - 1} times in a "
                                   "row with the same arguments and was NOT run again; change your approach "
                                   "or explain to the user what is blocking you"}
+                    elif block := self._run_hooks("PreToolUse", {"tool_input": call.args}, call.name)[0]:
+                        result = {"ok": False, "error": f"blocked by a PreToolUse hook: {block}"}
                     elif self._confirm(call.name, call.args):
                         result, shown = self._execute(call)
+                        feedback = self._run_hooks("PostToolUse", {"tool_input": call.args, "tool_response": result},
+                                                   call.name)[0]
+                        if feedback:  # хук просит модель обратить внимание на результат
+                            result = {**result, "hook_feedback": feedback}
                     else:
                         result = {"ok": False, "error": "user denied this action"}
                     ui.tool_result(result, streamed=shown)
@@ -171,6 +268,13 @@ class Agent:
             # Ctrl+C: прерываем запрос к модели или инструмент, но историю оставляем валидной.
             self._log("cancelled")
             return self._stop(pending or [], results, "cancelled by user", "Прервано пользователем (Ctrl+C).")
+
+    def _cancelled_outside_turn(self) -> str:
+        """Ctrl+C там, где история уже валидна (хук до начала задачи или после финального ответа): ничего не закрываем."""
+        self._log("cancelled")
+        msg = "Прервано пользователем (Ctrl+C)."
+        ui.error(msg)
+        return msg
 
     def _stop(self, pending: list, results: list, reason: str, msg: str) -> str:
         self._close_turn(pending, results, reason, f"[{reason}]")  # для модели: по-английски

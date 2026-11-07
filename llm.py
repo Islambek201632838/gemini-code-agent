@@ -4,6 +4,7 @@
 тот же интерфейс: LLM.generate(), LLM.user_message(), LLM.tool_results_message().
 agent.py считает сообщения истории непрозрачными объектами и никогда не заглядывает внутрь.
 """
+import json
 import os
 import random
 import time
@@ -15,6 +16,17 @@ from google.genai import errors, types
 DEFAULT_MODEL = "gemini-3.5-flash"
 RETRY_STATUS = {429, 500, 502, 503, 504}  # лимит запросов / перегрузка: стоит повторить
 MAX_RETRIES = 5
+SUMMARY_RESULT_CHARS = 1500    # результат инструмента в тексте для сжатия обрезается: детали модели не нужны
+SUMMARY_TRANSCRIPT_CHARS = 600_000  # если история ещё больше, в сводку идёт её хвост
+
+SUMMARY_SYSTEM = "You compress conversations between a user and a coding assistant into notes for the assistant itself."
+SUMMARY_PROMPT = """Summarize the conversation below so the assistant can continue the work without seeing it.
+Write in the language the user used. Keep it dense and factual. Include:
+1. What the user asked for and their preferences or constraints.
+2. What was done: files read, created or changed (with paths), commands run and their outcomes.
+3. Key findings, decisions, and errors that were hit (and how they were resolved).
+4. The current state and what remains to be done.
+Do not invent anything that is not in the conversation. Output only the summary."""
 
 
 @dataclass
@@ -106,6 +118,40 @@ class LLM:
         # ПОЧЕМУ мы храним «родной» объект content: Gemini 3 прикрепляет к нему
         # "thought signatures", и их нужно вернуть без изменений в следующем запросе.
         return Reply(text=text, tool_calls=calls, usage=usage, message=response.candidates[0].content)
+
+    # --- сжатие истории (/compact) ---
+
+    @staticmethod
+    def _transcript(history: list) -> str:
+        """История -> обычный текст. Вызовы и результаты инструментов пересказываются, результаты усечены."""
+        lines = []
+        for msg in history:
+            who = "User" if msg.role == "user" else "Assistant"
+            for p in msg.parts or []:
+                if p.function_call:
+                    args = json.dumps(dict(p.function_call.args or {}), ensure_ascii=False, default=str)
+                    lines.append(f"Assistant called {p.function_call.name}({args[:SUMMARY_RESULT_CHARS]})")
+                elif p.function_response:
+                    result = json.dumps(p.function_response.response, ensure_ascii=False, default=str)
+                    if len(result) > SUMMARY_RESULT_CHARS:
+                        result = result[:SUMMARY_RESULT_CHARS] + "...[truncated]"
+                    lines.append(f"Result of {p.function_response.name}: {result}")
+                elif p.text and not p.thought:
+                    lines.append(f"{who}: {p.text}")
+        return "\n".join(lines)[-SUMMARY_TRANSCRIPT_CHARS:]
+
+    def summarize(self, history: list, instructions: str = "") -> str:
+        """Краткое изложение истории обычным текстом (без инструментов и без thought signatures)."""
+        prompt = SUMMARY_PROMPT + (f"\nThe user asks to focus on: {instructions}" if instructions else "")
+        prompt += f"\n\n<conversation>\n{self._transcript(history)}\n</conversation>"
+        response = self._with_retry(lambda: self.client.models.generate_content(
+            model=self.model, contents=[self.user_message(prompt)],
+            config=types.GenerateContentConfig(system_instruction=SUMMARY_SYSTEM)))
+        parts = response.candidates[0].content.parts if response.candidates and response.candidates[0].content else []
+        text = "".join(p.text for p in parts or [] if p.text and not p.thought).strip()
+        if not text:
+            raise RuntimeError("model returned an empty summary")
+        return text
 
     @staticmethod
     def _with_retry(fn):

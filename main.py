@@ -5,9 +5,28 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import project as project_mod
 import ui
+from hooks import Hooks
 
 load_dotenv()  # читает GEMINI_API_KEY / GEMINI_MODEL из .env
+
+
+def confirm_hooks(hooks, auto_yes: bool):
+    """Хуки из workspace — это произвольные команды оболочки: показываем их и спрашиваем, как и для run_bash."""
+    if not hooks or auto_yes:
+        return hooks
+    print("В workspace настроены хуки (команды выполнятся на вашей машине):")
+    for h in hooks.hooks:
+        print(f"  {h.event}" + (f" [{h.matcher}]" if h.matcher else "") + f": {h.command}")
+    try:
+        answer = input("Включить хуки? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer in ("y", "yes", "д", "да"):
+        return hooks
+    ui.info("Хуки отключены на эту сессию.")
+    return Hooks([], hooks.workspace)
 
 
 def main():
@@ -23,13 +42,18 @@ def main():
     workspace.mkdir(parents=True, exist_ok=True)
 
     from agent import Agent, find_latest_log  # импортируем поздно, чтобы --help работал без API-ключа
+    from commands import handle
     from llm import LLM
     try:
         llm = LLM()
     except KeyError:
         sys.exit("GEMINI_API_KEY не задан. Скопируйте .env.example в .env и заполните его.")
 
-    agent = Agent(llm, workspace, auto_yes=args.yes, max_steps=args.max_steps)
+    proj = project_mod.load(workspace)  # CLAUDE.md, навыки и хуки из workspace
+    for w in proj.warnings:
+        ui.error(w)
+    hooks = confirm_hooks(Hooks(proj.hooks, workspace.resolve()), args.yes)
+    agent = Agent(llm, workspace, auto_yes=args.yes, max_steps=args.max_steps, project=proj, hooks=hooks)
     resumed = None
     if args.resume:
         log = find_latest_log() if args.resume == "latest" else Path(args.resume)
@@ -39,7 +63,11 @@ def main():
             resumed = (agent.resume(log), log)
         except ValueError as e:
             sys.exit(str(e))
-    ui.banner(llm.model, agent.workspace, agent.log_path)
+    context = ", ".join(filter(None, [
+        "CLAUDE.md" if proj.instructions else "",
+        f"навыков: {len(proj.skills)}" if proj.skills else "",
+        f"хуков: {len(hooks.hooks)}" if hooks else ""]))
+    ui.banner(llm.model, agent.workspace, agent.log_path, context)
     if resumed:
         ui.info(f"Сессия восстановлена: {resumed[0]} сообщений из {resumed[1]}")
     while True:
@@ -50,6 +78,8 @@ def main():
             break
         if task == "/exit":
             break
+        if task.startswith("/") and handle(agent, task):
+            continue
         if task:
             agent.run(task)  # ответ и ошибки печатает сам агент через ui
 

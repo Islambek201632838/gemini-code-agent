@@ -16,6 +16,8 @@ import threading
 import time
 from pathlib import Path
 
+import project
+
 MAX_OUTPUT_CHARS = 10_000
 MAX_RESULTS = 200  # ограничение на число совпадений glob / grep
 SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules"}
@@ -268,9 +270,17 @@ def run_bash(workspace, command, timeout=60, on_output=None):
     return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "output": output}
 
 
+def use_skill(workspace, name):
+    skills, _ = project.load_skills(Path(workspace))
+    skill = skills.get(name)
+    if skill is None:
+        raise ToolError(f"unknown skill '{name}'. Available: {sorted(skills)}")
+    return {"ok": True, "name": skill.name, "instructions": truncate(skill.render())}
+
+
 # ---------------------------------------------------------------- registry
 
-TOOLS = {f.__name__: f for f in (read_file, write_file, edit_file, glob, grep, run_bash)}
+TOOLS = {f.__name__: f for f in (read_file, write_file, edit_file, glob, grep, run_bash, use_skill)}
 NEEDS_CONFIRMATION = {"write_file", "edit_file", "run_bash"}
 
 
@@ -361,5 +371,13 @@ SCHEMAS = [
             "command": {"type": "string", "description": "Shell command to run."},
             "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)."},
         }, "required": ["command"]},
+    },
+    {
+        "name": "use_skill",
+        "description": "Load the full instructions of a skill listed under 'Available skills' in the system prompt. "
+                       "Call it when the user's task matches a skill's description, then follow the instructions.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Skill name exactly as listed."},
+        }, "required": ["name"]},
     },
 ]

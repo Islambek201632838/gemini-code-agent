@@ -43,16 +43,18 @@ def _indent(text: str, prefix: str = "  ") -> str:
 
 # ---------------------------------------------------------------- шапка и ввод
 
-def banner(model: str, workspace, log_path) -> None:
+def banner(model: str, workspace, log_path, context: str = "") -> None:
     rows = [("✻ Учебный кодинг-агент", ACCENT, BOLD), (f"модель: {model}",), (f"папка:  {workspace}",),
             (f"лог:    {log_path}",)]
+    if context:
+        rows.append((f"проект: {context}",))
     width = max(len(r[0]) for r in rows) + 2
     print(_c("╭" + "─" * (width + 2) + "╮", ACCENT))
     for text, *style in rows:
         pad = " " * (width - len(text))
         print(_c("│ ", ACCENT) + _c(text, *(style or [DIM])) + pad + _c(" │", ACCENT))
     print(_c("╰" + "─" * (width + 2) + "╯", ACCENT))
-    print(_c("  Введите задачу. /exit — выход, Ctrl+C — прервать.", DIM))
+    print(_c("  Введите задачу. /help — команды, /exit — выход, Ctrl+C — прервать.", DIM))
 
 
 def prompt() -> str:
@@ -165,6 +167,15 @@ def info(message: str) -> None:
 
 def error(message: str) -> None:
     print("\n" + _c("✗ " + message, RED))
+
+
+def hook(event: str, command: str, text: str, failed: bool = False) -> None:
+    """Сообщение хука: событие, команда и первые строки его вывода."""
+    lines = text.splitlines() or [""]
+    head = f"⚙ {event} · {_short(command, 50)}: {_short(lines[0], 70)}"
+    print("  " + _c(head, RED if failed else DIM))
+    for line in lines[1:4]:
+        print("      " + _c(_short(line), RED if failed else DIM))
 
 
 # ---------------------------------------------------------------- подтверждение
