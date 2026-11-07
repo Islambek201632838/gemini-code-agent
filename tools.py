@@ -6,8 +6,14 @@
 - Каждый путь проходит через safe_path(), поэтому модель не может выйти за пределы рабочей папки.
 - Каждый вывод обрезается, чтобы один огромный файл не затопил контекстное окно.
 """
+import codecs
+import os
+import queue
 import re
+import signal
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 MAX_OUTPUT_CHARS = 10_000
@@ -149,17 +155,117 @@ def check_command(command: str):
             raise ToolError(f"command blocked by denylist (pattern: {pattern})")
 
 
-def run_bash(workspace, command, timeout=60):
-    check_command(command)
+class _Capture:
+    """Копит текст потока, но не больше limit символов: остальное только считается.
+
+    ПОЧЕМУ: truncate() режет уже накопленную строку, а команда может выдать гигабайты.
+    Здесь лимит действует во время чтения, поэтому память ограничена всегда.
+    """
+
+    def __init__(self, limit: int = MAX_OUTPUT_CHARS):
+        self.limit = limit
+        self.parts: list[str] = []
+        self.size = 0
+        self.dropped = 0
+
+    def feed(self, text: str) -> None:
+        room = self.limit - self.size
+        if room > 0:
+            self.parts.append(text[:room])
+            self.size += min(len(text), room)
+        self.dropped += max(len(text) - max(room, 0), 0)
+
+    def result(self) -> str:
+        text = "".join(self.parts)
+        return text + f"\n...[truncated: {self.dropped} more characters]" if self.dropped else text
+
+
+def _pump(pipe, name: str, q: queue.Queue) -> None:
+    """Поток-читатель: перекладывает вывод процесса в очередь, пока не EOF (тогда кладёт None).
+
+    Читаем всегда до конца, даже когда лимит исчерпан: иначе процесс заблокируется на полном буфере.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
-        r = subprocess.run(
-            command, shell=True, cwd=workspace.resolve(), capture_output=True,
-            text=True, timeout=int(timeout),
-        )
-    except subprocess.TimeoutExpired:
-        raise ToolError(f"command timed out after {timeout}s") from None
-    out = truncate((r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else ""))
-    return {"ok": r.returncode == 0, "exit_code": r.returncode, "output": out}
+        for chunk in iter(lambda: pipe.read(65536), b""):
+            text = decoder.decode(chunk)
+            if text:
+                q.put((name, text))
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            q.put((name, tail))
+    finally:
+        pipe.close()
+        q.put(None)
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Убить ВСЮ группу процессов команды, а не только shell: иначе потомки остаются жить."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)  # pid == pgid, т.к. запуск с start_new_session=True
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_bash(workspace, command, timeout=60, on_output=None):
+    """Выполнить команду в workspace.
+
+    - start_new_session: команда получает свою группу процессов; по таймауту и по Ctrl+C
+      убивается вся группа (os.killpg).
+    - stdin=DEVNULL: команда не может ждать ввод и повиснуть; интерактивные программы получают EOF.
+    - вывод читается потоками и сразу отдаётся в on_output(stream, text), с лимитом размера во время чтения.
+    """
+    check_command(command)
+    timeout = int(timeout)
+    proc = subprocess.Popen(
+        command, shell=True, cwd=workspace.resolve(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True,
+    )
+    q: queue.Queue = queue.Queue()
+    captures = {"stdout": _Capture(), "stderr": _Capture()}
+    for name in captures:
+        threading.Thread(target=_pump, args=(getattr(proc, name), name, q), daemon=True).start()
+
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        open_streams = len(captures)
+        while open_streams:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                item = q.get(timeout=min(remaining, 0.2))  # короткие паузы: Ctrl+C обрабатывается быстро
+            except queue.Empty:
+                continue
+            if item is None:
+                open_streams -= 1
+                continue
+            name, text = item
+            captures[name].feed(text)
+            if on_output:
+                on_output(name, text)
+        if not timed_out:
+            try:
+                proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+    except BaseException:  # в том числе KeyboardInterrupt: не оставляем процессы-сироты
+        _kill_group(proc)
+        proc.wait()
+        raise
+    if timed_out:
+        _kill_group(proc)
+        proc.wait()
+
+    out = captures["stdout"].result()
+    err = captures["stderr"].result()
+    output = out + (("\n[stderr]\n" + err) if err else "")
+    if timed_out:
+        return {"ok": False, "exit_code": None, "output": output,
+                "error": f"command timed out after {timeout}s; the process group was killed"}
+    return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "output": output}
 
 
 # ---------------------------------------------------------------- registry
@@ -168,12 +274,22 @@ TOOLS = {f.__name__: f for f in (read_file, write_file, edit_file, glob, grep, r
 NEEDS_CONFIRMATION = {"write_file", "edit_file", "run_bash"}
 
 
-def execute(workspace: Path, name: str, args: dict) -> dict:
-    """Выполнить инструмент по имени; ЛЮБОЙ сбой становится структурированной ошибкой для модели."""
+STREAMING = {"run_bash"}  # инструменты, умеющие отдавать вывод по мере появления (on_output)
+
+
+def execute(workspace: Path, name: str, args: dict, on_output=None) -> dict:
+    """Выполнить инструмент по имени; ЛЮБОЙ сбой становится структурированной ошибкой для модели.
+
+    on_output(stream, text) получает живой вывод стриминговых инструментов. KeyboardInterrupt (это не Exception)
+    намеренно не перехватывается: его обрабатывает цикл агента.
+    """
     fn = TOOLS.get(name)
     if fn is None:
         return {"ok": False, "error": f"unknown tool '{name}'. Available: {sorted(TOOLS)}"}
     try:
+        if name in STREAMING:
+            args = {k: v for k, v in args.items() if k != "on_output"}  # модель не должна подсунуть свой колбэк
+            return fn(workspace, on_output=on_output, **args)
         return fn(workspace, **args)
     except ToolError as e:
         return {"ok": False, "error": str(e)}
@@ -238,6 +354,8 @@ SCHEMAS = [
         "name": "run_bash",
         "description": "Run a shell command in the workspace directory and return output and exit code. "
                        "Use it to run tests or scripts to verify your changes. "
+                       "Commands run non-interactively: stdin is closed, so never run anything that waits for input "
+                       "(pass --yes / -y / --no-input flags). The whole process group is killed on timeout. "
                        "Do not use it for reading/searching/editing files: use the dedicated tools.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string", "description": "Shell command to run."},
