@@ -16,6 +16,7 @@ ACCENT = "38;5;173"  # тёплый оранжевый, как у Claude Code
 RED, GREEN, CYAN, DIM, BOLD = "31", "32", "36", "2", "1"
 
 PREVIEW_LINES = 6   # сколько строк вывода инструмента показывать
+LIVE_LINES = 20     # сколько строк вывода команды показывать вживую
 LINE_WIDTH = 110    # длинные строки обрезаем, полный результат всё равно есть в JSONL-логе
 
 
@@ -88,8 +89,45 @@ def tool_call(name: str, args: dict) -> None:
     print("\n" + _c("●", GREEN) + " " + _c(name, BOLD) + _c(f"({_short(_args_summary(name, args), 90)})", DIM))
 
 
-def tool_result(result: dict) -> None:
-    """Короткая человекочитаемая сводка вместо сырого JSON."""
+class LiveOutput:
+    """Живой вывод команды: печатает строки по мере появления, не больше LIVE_LINES.
+
+    Остальное молча считается, а полный (обрезанный до лимита) вывод всё равно уходит модели и в JSONL-лог.
+    Вызывается из основного потока: tools.run_bash отдаёт текст через очередь.
+    """
+
+    def __init__(self):
+        self.shown = False   # напечатали ли хоть что-то (тогда итоговая сводка без повторного превью)
+        self._printed = 0
+        self._skipped = 0
+        self._buf = {"stdout": "", "stderr": ""}
+
+    def __call__(self, stream: str, text: str) -> None:
+        *lines, self._buf[stream] = (self._buf[stream] + text).split("\n")
+        for line in lines:
+            self._line(line)
+
+    def _line(self, line: str) -> None:
+        if not line.strip():
+            return
+        if self._printed >= LIVE_LINES:
+            self._skipped += 1
+            return
+        self.shown = True
+        self._printed += 1
+        print("    " + _c(_short(line.rstrip().split("\r")[-1]), DIM), flush=True)  # \r: берём последнюю перерисовку
+
+    def close(self) -> None:
+        for stream in self._buf:  # последняя строка без перевода строки
+            self._line(self._buf[stream])
+            self._buf[stream] = ""
+        if self._skipped:
+            print("    " + _c(f"… ещё строк: {self._skipped}", DIM), flush=True)
+            self._skipped = 0
+
+
+def tool_result(result: dict, streamed: bool = False) -> None:
+    """Короткая человекочитаемая сводка вместо сырого JSON. streamed: вывод уже был показан вживую."""
     if not result.get("ok", False) and "error" in result:
         print("  " + _c("⎿ ✗ " + _short(str(result["error"])), RED))
         return
@@ -113,10 +151,16 @@ def tool_result(result: dict) -> None:
 
     failed = "exit_code" in result and not result.get("ok")
     print("  " + _c("⎿ " + ("✗ " if failed else "✓ ") + summary, RED if failed else DIM))
+    if streamed:
+        return
     for line in preview[:PREVIEW_LINES]:
         print("    " + _c(_short(line), DIM))
     if len(preview) > PREVIEW_LINES:
         print("    " + _c(f"… ещё {len(preview) - PREVIEW_LINES}", DIM))
+
+
+def info(message: str) -> None:
+    print(_c("  " + message, DIM))
 
 
 def error(message: str) -> None:

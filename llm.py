@@ -50,6 +50,30 @@ class LLM:
         ]
         return types.Content(role="user", parts=parts)
 
+    def model_message(self, text: str):
+        """Служебное сообщение модели (например, «прервано пользователем»): сохраняет чередование ролей."""
+        return types.Content(role="model", parts=[types.Part(text=text)])
+
+    # --- сохранение и восстановление истории (возобновление сессий) ---
+
+    @staticmethod
+    def dump_message(message) -> dict:
+        """Сообщение истории -> JSON-совместимый dict. Подписи мыслей (bytes) кодируются в base64 без потерь."""
+        return message.model_dump(mode="json", exclude_none=True)
+
+    @staticmethod
+    def load_message(data: dict):
+        """Обратная операция к dump_message."""
+        return types.Content.model_validate(data)
+
+    @staticmethod
+    def unanswered_calls(history: list) -> list[ToolCall]:
+        """Вызовы инструментов в последнем сообщении модели, если на них нет результатов (оборванная сессия)."""
+        if not history or history[-1].role != "model":
+            return []
+        return [ToolCall(name=p.function_call.name, args=dict(p.function_call.args or {}), id=p.function_call.id)
+                for p in history[-1].parts or [] if p.function_call]
+
     # --- сам вызов ---
 
     def generate(self, history: list, system: str, tool_schemas: list[dict]) -> Reply:
