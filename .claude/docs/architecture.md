@@ -17,6 +17,7 @@ tests/                   workspace/ (демо-проект + .claude/)      logs
 | Файл | Ответственность | Что НЕ должен знать |
 |---|---|---|
 | `main.py` | argparse, REPL, `/exit`, загрузка `.env`, подтверждение хуков при старте | про формат сообщений модели |
+| `attachments.py` | разбор `@файл.png` в задаче, чтение файлов (png/jpg/webp, до 5 шт., до 7 МБ) | про Gemini и про цикл |
 | `commands.py` | слэш-команды `/clear`, `/compact`, `/help`, `/<навык>`; всё, что не похоже на команду, возвращает как задачу | про Gemini |
 | `project.py` | чтение `CLAUDE.md`, `.claude/skills/*/SKILL.md`, `.claude/settings.json`; сборка системного промпта | про LLM и про цикл |
 | `hooks.py` | разбор настроек хуков, запуск команд хуков (группа процессов, таймаут) | про LLM и про `agent.py` |
@@ -55,6 +56,10 @@ return "достигнут лимит шагов"
 - `/clear` → `Agent.clear()`: `history = []`, в лог пишется `reset`.
 - `/compact [текст]` → `Agent.compact()`: `llm.summarize(history, текст)` присылает пересказ, история становится `[user: пересказ, model: подтверждение]` (роли чередуются), в лог `reset` и два `message`. Пока модель не ответила, история не трогается: ошибка API и Ctrl+C её не портят. Автосжатия по размеру нет, только по команде.
 
+## Вложения в задаче
+
+`main.py` передаёт строку в `attachments.extract(task, cwd, workspace)` -> `(текст, файлы, заметки)`. Токен `@путь` к существующему файлу поддерживаемого типа (таблица `MIME`, по документации Gemini; живой API не проверялся) заменяется на `[file N: имя]`, файл уходит модели. Неподдерживаемый тип: заметка `✗ не поддерживается`, токен остаётся текстом, файл не отправляется. `@слово`, не являющееся файлом, остаётся текстом; `@x.png` без файла, превышение лимитов (5 файлов, 7 МБ на файл, 15 МБ всего) это `AttachmentError`: задача не уходит. Заметки печатает `main.py`, затем `Agent.run(task, files)`. В лог вложения попадают в base64 внутри события `message` (нужно для `--resume`), в событии `task` только их число. `/compact` в пересказе упоминает вложение, но сам файл не передаёт.
+
 ## Контекст проекта (`project.py`)
 
 Читается один раз при старте из workspace; файлы, чей реальный путь выходит за workspace (симлинк), игнорируются с предупреждением.
@@ -84,7 +89,7 @@ return "достигнут лимит шагов"
 ## Контракт `llm.py` (менять провайдера = переписать только этот файл)
 
 - `LLM(model=None)`: модель берётся из аргумента, затем `GEMINI_MODEL`, затем `DEFAULT_MODEL` (`gemini-3.5-flash`).
-- `LLM.user_message(text)`, `LLM.model_message(text)` (служебное сообщение модели, сохраняет чередование ролей) и `LLM.tool_results_message([(ToolCall, result_dict), ...])` строят элементы истории.
+- `LLM.user_message(text, files=None)` (`files`: вложения, пары `(mime, bytes)`, идут после текста), `LLM.model_message(text)` (служебное сообщение модели, сохраняет чередование ролей) и `LLM.tool_results_message([(ToolCall, result_dict), ...])` строят элементы истории.
 - `LLM.dump_message(msg) -> dict` / `LLM.load_message(dict)`: сериализация для лога и `--resume`; bytes (thought signatures) кодируются в base64 без потерь (тест `tests/test_llm.py`). `LLM.unanswered_calls(history)` находит вызовы без результатов в оборванной сессии.
 - `LLM.summarize(history, instructions="") -> str`: пересказ истории для `/compact`. История переводится в обычный текст (вызовы инструментов пересказаны, результаты усечены до 1500 символов), поэтому thought signatures и function_call не нужны; инструментов в запросе нет.
 - `LLM.generate(history, system, tool_schemas) -> Reply`, где `Reply = (text, tool_calls: list[ToolCall], usage: dict, message)`.

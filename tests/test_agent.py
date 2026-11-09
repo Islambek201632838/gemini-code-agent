@@ -23,7 +23,7 @@ class FakeLLM:
     def __init__(self, replies):
         self.replies = list(replies)  # элементы: Reply или исключение, которое надо бросить
 
-    def user_message(self, text):
+    def user_message(self, text, files=None):
         return {"role": "user", "text": text}
 
     def tool_results_message(self, results):

@@ -51,8 +51,11 @@ class LLM:
 
     # --- конструкторы сообщений истории (форматы конкретного провайдера живут здесь) ---
 
-    def user_message(self, text: str):
-        return types.Content(role="user", parts=[types.Part(text=text)])
+    def user_message(self, text: str, files: list[tuple[str, bytes]] | None = None):
+        """Реплика пользователя; files: вложения, пары (mime, bytes), идут после текста."""
+        parts = [types.Part(text=text)]
+        parts += [types.Part.from_bytes(data=data, mime_type=mime) for mime, data in files or []]
+        return types.Content(role="user", parts=parts)
 
     def tool_results_message(self, results: list[tuple[ToolCall, dict]]):
         """Все результаты одного хода модели попадают в ОДНО пользовательское сообщение."""
@@ -138,6 +141,8 @@ class LLM:
                     lines.append(f"Result of {p.function_response.name}: {result}")
                 elif p.text and not p.thought:
                     lines.append(f"{who}: {p.text}")
+                elif p.inline_data:
+                    lines.append(f"{who} attached a file ({p.inline_data.mime_type})")
         return "\n".join(lines)[-SUMMARY_TRANSCRIPT_CHARS:]
 
     def summarize(self, history: list, instructions: str = "") -> str:

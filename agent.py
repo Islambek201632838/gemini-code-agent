@@ -181,7 +181,7 @@ class Agent:
         # ui показывает действие целиком (команду, diff, содержимое): пользователь одобряет именно это.
         return input(ui.confirm_request(name, args)).strip().lower() in ("y", "yes", "д", "да")
 
-    def run(self, task: str) -> str:
+    def run(self, task: str, files: list[tuple[str, bytes]] | None = None) -> str:
         try:
             block, context = self._run_hooks("UserPromptSubmit", {"prompt": task})
         except KeyboardInterrupt:  # задача ещё не в истории: отменять нечего
@@ -191,8 +191,9 @@ class Agent:
             self._log("task_blocked", task=task, reason=block)
             ui.error(msg)
             return msg
-        self._add(self.llm.user_message(task + (f"\n\n[Context from UserPromptSubmit hook]\n{context}" if context else "")))
-        self._log("task", task=task)
+        self._add(self.llm.user_message(
+            task + (f"\n\n[Context from UserPromptSubmit hook]\n{context}" if context else ""), files))
+        self._log("task", task=task, files=len(files or []))
 
         pending: list | None = None  # вызовы хода, для которых tool_results ещё не в истории (нужно при Ctrl+C)
         results: list = []

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import attachments
 import project as project_mod
 import ui
 from hooks import Hooks
@@ -81,7 +82,14 @@ def main():
         if task.startswith("/") and handle(agent, task):
             continue
         if task:
-            agent.run(task)  # ответ и ошибки печатает сам агент через ui
+            try:  # @картинка.png в тексте становится вложением
+                task, files, notes = attachments.extract(task, Path.cwd(), agent.workspace)
+            except attachments.AttachmentError as e:
+                ui.error(str(e))
+                continue
+            for note in notes:
+                (ui.error if note.startswith("✗") else ui.info)(note)
+            agent.run(task, files)  # ответ и ошибки печатает сам агент через ui
 
 
 if __name__ == "__main__":
