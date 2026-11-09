@@ -1,5 +1,6 @@
 """Интерактивный CLI: введите задачу, наблюдайте за работой агента, /exit для выхода."""
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -54,7 +55,12 @@ def main():
     for w in proj.warnings:
         ui.error(w)
     hooks = confirm_hooks(Hooks(proj.hooks, workspace.resolve()), args.yes)
-    agent = Agent(llm, workspace, auto_yes=args.yes, max_steps=args.max_steps, project=proj, hooks=hooks)
+    try:  # порог автосжатия в токенах prompt; не задан или 0: выключено
+        compact_at = int(os.environ.get("GEMINI_COMPACT_TOKENS") or 0)
+    except ValueError:
+        sys.exit("GEMINI_COMPACT_TOKENS должен быть целым числом (токенов).")
+    agent = Agent(llm, workspace, auto_yes=args.yes, max_steps=args.max_steps, project=proj, hooks=hooks,
+                  compact_at=compact_at)
     resumed = None
     if args.resume:
         log = find_latest_log() if args.resume == "latest" else Path(args.resume)
@@ -73,7 +79,7 @@ def main():
         ui.info(f"Сессия восстановлена: {resumed[0]} сообщений из {resumed[1]}")
     while True:
         try:
-            task = input(ui.prompt()).strip()
+            task = input(ui.prompt(agent.plan_mode)).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break

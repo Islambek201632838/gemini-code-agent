@@ -282,6 +282,9 @@ def use_skill(workspace, name):
 
 TOOLS = {f.__name__: f for f in (read_file, write_file, edit_file, glob, grep, run_bash, use_skill)}
 NEEDS_CONFIRMATION = {"write_file", "edit_file", "run_bash"}
+# Инструменты, которые ничего не меняют: только они доступны в режиме планирования и субагенту.
+# run_bash и use_skill сюда не входят: команда и навык могут писать файлы.
+READ_ONLY_TOOLS = {"read_file", "glob", "grep"}
 
 
 STREAMING = {"run_bash"}  # инструменты, умеющие отдавать вывод по мере появления (on_output)
@@ -379,5 +382,16 @@ SCHEMAS = [
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "Skill name exactly as listed."},
         }, "required": ["name"]},
+    },
+    {
+        # Выполняется в agent.py (нужен доступ к LLM), поэтому в TOOLS этой функции нет.
+        "name": "run_subagent",
+        "description": "Delegate a self-contained READ-ONLY investigation (e.g. 'find where X is handled and "
+                       "summarize how it works') to a fresh subagent with its own empty context. It can only use "
+                       "read_file/glob/grep and returns only a short summary, so large exploration does not fill "
+                       "your context. Put everything it needs to know into the prompt: it cannot see this conversation.",
+        "parameters": {"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "Complete, self-contained task for the subagent."},
+        }, "required": ["prompt"]},
     },
 ]

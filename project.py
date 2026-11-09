@@ -19,7 +19,7 @@ INSTRUCTION_FILES = ("CLAUDE.md", ".claude/CLAUDE.md")
 MAX_INSTRUCTIONS_CHARS = 20_000
 MAX_SKILL_CHARS = 20_000
 SKILL_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
-RESERVED = {"exit", "clear", "compact", "help"}  # имена встроенных команд: навык не может их занять
+RESERVED = {"exit", "clear", "compact", "help", "plan"}  # имена встроенных команд: навык не может их занять
 
 
 @dataclass

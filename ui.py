@@ -57,9 +57,9 @@ def banner(model: str, workspace, log_path, context: str = "") -> None:
     print(_c("  Введите задачу. /help — команды, /exit — выход, Ctrl+C — прервать.", DIM))
 
 
-def prompt() -> str:
+def prompt(plan_mode: bool = False) -> str:
     # Без ANSI в строке приглашения: иначе readline неверно считает ширину и ломает редактирование.
-    return "\n> "
+    return "\n[plan] > " if plan_mode else "\n> "
 
 
 # ---------------------------------------------------------------- ход агента
@@ -148,6 +148,9 @@ def tool_result(result: dict, streamed: bool = False) -> None:
         code = result.get("exit_code")
         summary = "выполнено" if code == 0 else f"завершилось с кодом {code}"
         preview = [line for line in str(result["output"]).splitlines() if line.strip()]
+    elif "result" in result:  # резюме субагента
+        summary = f"резюме субагента: {len(str(result['result']))} символов"
+        preview = [line for line in str(result["result"]).splitlines() if line.strip()]
     else:
         summary = str(result.get("message", "готово"))
 

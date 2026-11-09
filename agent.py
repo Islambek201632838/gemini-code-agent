@@ -33,6 +33,16 @@ SYSTEM_PROMPT = """You are a coding assistant working inside a workspace directo
 
 COMPACT_ACK = "Understood. I have the summary of the earlier conversation and will continue from it."
 
+# Дописывается к системному промпту в режиме планирования (/plan) и у субагента (только чтение).
+PLAN_SUFFIX = """PLAN MODE is on: you are read-only. Only read_file, glob and grep are available; nothing can be changed.
+Investigate the task, then reply with a short numbered plan: which files you would change and how, and how to verify it.
+Do not try to make changes. The user will leave plan mode and ask you to carry the plan out."""
+SUBAGENT_SUFFIX = """You are a read-only research subagent. Only read_file, glob and grep are available.
+Investigate the task you were given and finish with a concise, self-contained summary of your findings
+(file paths and line numbers where useful). Your final message is the ONLY thing the caller will see."""
+
+SUBAGENT_MAX_STEPS = 12  # субагент не должен тратить столько же шагов, сколько основной агент
+
 REPEAT_BLOCK = 3  # столько одинаковых вызовов подряд: третий не выполняется, модель получает подсказку сменить подход
 REPEAT_STOP = 5   # а на пятом цикл останавливается
 
@@ -48,19 +58,41 @@ def find_latest_log(log_dir: Path = Path("logs")) -> Path | None:
 class Agent:
     def __init__(self, llm: LLM, workspace: Path, auto_yes: bool = False,
                  max_steps: int = 25, log_dir: Path = Path("logs"),
-                 project: Project | None = None, hooks: Hooks | None = None):
+                 project: Project | None = None, hooks: Hooks | None = None,
+                 compact_at: int | None = None, read_only: bool = False, log_name: str | None = None):
         self.llm = llm
         self.workspace = workspace.resolve()
         self.project = project or Project()
         self.hooks = hooks or Hooks([], self.workspace)
+        self.read_only = read_only  # субагент: всегда только чтение, без собственных субагентов
         self.system = self.project.system_prompt(SYSTEM_PROMPT)  # + навыки и CLAUDE.md
+        if read_only:
+            self.system += "\n\n" + SUBAGENT_SUFFIX
         # use_skill имеет смысл, только если есть навыки: иначе не показываем его модели
         self.schemas = [s for s in tools.SCHEMAS if self.project.skills or s["name"] != "use_skill"]
         self.auto_yes = auto_yes
         self.max_steps = max_steps
+        self.compact_at = compact_at or None  # порог usage.prompt в токенах для автосжатия; None/0: выключено
+        self.last_prompt: int | None = None   # размер промпта по последнему ответу модели (None: неизвестен)
+        self.plan_mode = False                # /plan: доступны только инструменты чтения
+        self.outcome = "failed"               # как закончился последний run(): done / cancelled / failed
+        self._subagents = 0
         self.history: list = []  # непрозрачные сообщения провайдера; сохраняются между задачами в одной сессии REPL
         log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_path = log_dir / f"run-{datetime.now():%Y%m%d-%H%M%S}.jsonl"
+        self.log_path = log_dir / (log_name or f"run-{datetime.now():%Y%m%d-%H%M%S}.jsonl")
+
+    # --- режим планирования ---
+
+    def set_plan_mode(self, on: bool) -> None:
+        self.plan_mode = on
+        self._log("mode", plan=on)
+
+    def _allowed(self, name: str) -> bool:
+        """В режиме планирования и у субагента доступны только инструменты чтения."""
+        return name in tools.READ_ONLY_TOOLS if (self.plan_mode or self.read_only) else True
+
+    def _system(self) -> str:
+        return self.system + "\n\n" + PLAN_SUFFIX if self.plan_mode else self.system
 
     def _log(self, event: str, **data):
         with self.log_path.open("a", encoding="utf-8") as f:
@@ -102,6 +134,7 @@ class Agent:
     def clear(self) -> None:
         """Начать разговор с чистого листа. Файл лога тот же; событие reset говорит --resume забыть прошлое."""
         self.history = []
+        self.last_prompt = None
         self._log("reset", reason="clear")
 
     def compact(self, instructions: str = "") -> bool:
@@ -125,6 +158,7 @@ class Agent:
             ui.error(msg)
             return False
         self.history = []
+        self.last_prompt = None
         self._log("reset", reason="compact")
         self._add(self.llm.user_message("Summary of the earlier conversation (the full history was compacted):\n\n"
                                         + summary))
@@ -167,6 +201,8 @@ class Agent:
 
     def _execute(self, call) -> tuple[dict, bool]:
         """Выполнить вызов. Для run_bash вывод стримится в консоль; второй элемент: был ли он показан."""
+        if call.name == "run_subagent":  # нужен доступ к LLM, поэтому не в tools.py
+            return self._run_subagent(call.args), False
         if call.name != "run_bash":
             return tools.execute(self.workspace, call.name, call.args), False
         live = ui.LiveOutput()
@@ -175,6 +211,40 @@ class Agent:
         finally:
             live.close()
 
+    def _run_subagent(self, args: dict) -> dict:
+        """Запустить субагента с чистой историей (только чтение) и вернуть родителю лишь его итоговый текст.
+
+        История субагента в историю родителя не попадает; у него свой лог в подкаталоге рядом с логом родителя
+        (там его не найдёт find_latest_log). Ctrl+C останавливает и субагента, и родителя.
+        """
+        prompt = args.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return {"ok": False, "error": "bad arguments for run_subagent: 'prompt' must be a non-empty string"}
+        self._subagents += 1
+        sub = Agent(self.llm, self.workspace, max_steps=min(self.max_steps, SUBAGENT_MAX_STEPS),
+                    log_dir=self.log_path.parent / f"{self.log_path.stem}-subagents",
+                    project=Project(instructions=self.project.instructions),  # CLAUDE.md да, навыки и хуки нет
+                    read_only=True, log_name=f"sub{self._subagents:02d}.jsonl")
+        ui.info(f"Субагент #{self._subagents} (только чтение) запущен, лог: {sub.log_path}")
+        answer = sub.run(prompt)
+        if sub.outcome == "cancelled":
+            raise KeyboardInterrupt  # родитель закроет ход сам (_stop)
+        if sub.outcome != "done":
+            return {"ok": False, "error": f"subagent did not finish: {answer}"}
+        return {"ok": True, "result": answer}
+
+    def _maybe_auto_compact(self) -> None:
+        """Сжать историю перед новой задачей, если последний промпт перевалил порог.
+
+        Только здесь, между задачами: история заканчивается текстом модели, ни один вызов не висит.
+        Посреди хода сжимать нельзя: пары вызов/результат и thought signatures пришлось бы рвать.
+        """
+        if not self.compact_at or not self.history or self.last_prompt is None or self.last_prompt < self.compact_at:
+            return
+        ui.info(f"Автосжатие: промпт {self.last_prompt} токенов >= порога {self.compact_at}.")
+        self._log("auto_compact", prompt_tokens=self.last_prompt, threshold=self.compact_at)
+        self.compact()  # при сбое сама сообщает об ошибке и оставляет историю как есть
+
     def _confirm(self, name: str, args: dict) -> bool:
         if self.auto_yes or name not in tools.NEEDS_CONFIRMATION:
             return True
@@ -182,6 +252,7 @@ class Agent:
         return input(ui.confirm_request(name, args)).strip().lower() in ("y", "yes", "д", "да")
 
     def run(self, task: str, files: list[tuple[str, bytes]] | None = None) -> str:
+        self.outcome = "failed"  # станет done/cancelled в соответствующих ветках; нужен run_subagent
         try:
             block, context = self._run_hooks("UserPromptSubmit", {"prompt": task})
         except KeyboardInterrupt:  # задача ещё не в истории: отменять нечего
@@ -191,6 +262,7 @@ class Agent:
             self._log("task_blocked", task=task, reason=block)
             ui.error(msg)
             return msg
+        self._maybe_auto_compact()
         self._add(self.llm.user_message(
             task + (f"\n\n[Context from UserPromptSubmit hook]\n{context}" if context else ""), files))
         self._log("task", task=task, files=len(files or []))
@@ -202,7 +274,8 @@ class Agent:
         try:
             for step in range(1, self.max_steps + 1):
                 try:
-                    reply = self.llm.generate(self.history, self.system, self.schemas)
+                    schemas = [s for s in self.schemas if self._allowed(s["name"])]
+                    reply = self.llm.generate(self.history, self._system(), schemas)
                 except Exception as e:  # API не ответил даже после повторов: сообщаем и не роняем REPL
                     msg = f"Вызов LLM не удался: {type(e).__name__}: {e}"
                     self._log("llm_error", step=step, error=msg)
@@ -213,6 +286,7 @@ class Agent:
                 if reply.text:
                     ui.model_text(reply.text)  # пояснение к вызову и финальный ответ; main ничего не дублирует
                 ui.usage(step, self.max_steps, reply.usage)
+                self.last_prompt = (reply.usage or {}).get("prompt")
                 self._log("model", step=step, text=reply.text, usage=reply.usage,
                           tool_calls=[{"name": c.name, "args": c.args} for c in reply.tool_calls])
 
@@ -226,6 +300,7 @@ class Agent:
                             stop_hook_used = True
                             self._add(self.llm.user_message(f"[Stop hook] {block}"))
                             continue
+                    self.outcome = "done"
                     return reply.text
 
                 pending, results = reply.tool_calls, []
@@ -245,6 +320,9 @@ class Agent:
                         result = {"ok": False, "error": f"this exact call was already made {repeat - 1} times in a "
                                   "row with the same arguments and was NOT run again; change your approach "
                                   "or explain to the user what is blocking you"}
+                    elif not self._allowed(call.name):  # модель могла выдать имя, которого нет в схемах
+                        result = {"ok": False, "error": "tool not available in plan mode" if self.plan_mode
+                                  else "tool not available: this agent is read-only"}
                     elif block := self._run_hooks("PreToolUse", {"tool_input": call.args}, call.name)[0]:
                         result = {"ok": False, "error": f"blocked by a PreToolUse hook: {block}"}
                     elif self._confirm(call.name, call.args):
@@ -268,11 +346,13 @@ class Agent:
         except KeyboardInterrupt:
             # Ctrl+C: прерываем запрос к модели или инструмент, но историю оставляем валидной.
             self._log("cancelled")
+            self.outcome = "cancelled"
             return self._stop(pending or [], results, "cancelled by user", "Прервано пользователем (Ctrl+C).")
 
     def _cancelled_outside_turn(self) -> str:
         """Ctrl+C там, где история уже валидна (хук до начала задачи или после финального ответа): ничего не закрываем."""
         self._log("cancelled")
+        self.outcome = "cancelled"
         msg = "Прервано пользователем (Ctrl+C)."
         ui.error(msg)
         return msg
