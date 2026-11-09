@@ -18,12 +18,12 @@ tests/                   workspace/ (демо-проект + .claude/)      logs
 |---|---|---|
 | `main.py` | argparse, REPL, `/exit`, загрузка `.env`, подтверждение хуков при старте | про формат сообщений модели |
 | `attachments.py` | разбор `@файл.png` в задаче, чтение файлов (png/jpg/webp, до 5 шт., до 7 МБ) | про Gemini и про цикл |
-| `commands.py` | слэш-команды `/clear`, `/compact`, `/plan`, `/help`, `/<навык>`; всё, что не похоже на команду, возвращает как задачу | про Gemini |
+| `commands.py` | слэш-команды `/clear`, `/compact`, `/plan`, `/agents`, `/agent N`, `/help`, `/<навык>`; всё, что не похоже на команду, возвращает как задачу | про Gemini |
 | `project.py` | чтение `CLAUDE.md`, `.claude/skills/*/SKILL.md`, `.claude/settings.json`; сборка системного промпта | про LLM и про цикл |
 | `hooks.py` | разбор настроек хуков, запуск команд хуков (группа процессов, таймаут) | про LLM и про `agent.py` |
 | `agent.py` | цикл, подтверждения, JSONL-лог (консольный вывод делегирует `ui.py`), лимит шагов, вызов хуков, `clear()` / `compact()`, режим плана, автосжатие, `run_subagent` | про Gemini и его типы |
 | `llm.py` | вызов API, retry/backoff, сборка сообщений, `summarize()` для `/compact` | про инструменты (получает только схемы) |
-| `ui.py` | баннер, трейс шагов, сводки результатов вместо сырого JSON, diff в подтверждении; цвета только в TTY, отключаются `NO_COLOR` | про LLM и про `tools` |
+| `ui.py` | баннер, трейс шагов, сводки результатов вместо сырого JSON, diff в подтверждении, `Quiet`/`Nested` для субагентов; цвета только в TTY, отключаются `NO_COLOR` | про LLM и про `tools` |
 | `tools.py` | 7 инструментов (в том числе `use_skill`), `SCHEMAS`, `safe_path`, усечение, денилист | про LLM и про подтверждения |
 
 ## Цикл агента (`Agent.run` в `agent.py`)
@@ -59,7 +59,10 @@ return "достигнут лимит шагов"
 ## Режим планирования и субагенты
 
 - `/plan` → `Agent.set_plan_mode(True)` (лог: `mode`). Пока режим включён, `generate` получает только схемы из `tools.READ_ONLY_TOOLS` (`read_file`, `glob`, `grep`; `run_bash` и `use_skill` исключены, они могут писать) и системный промпт с `PLAN_SUFFIX`. Если модель всё равно назвала другой инструмент, цикл возвращает ошибку-результат `tool not available in plan mode` до хуков и подтверждения. `/plan off` отключает режим; `self.system` не меняется, добавка клеится при каждом запросе.
-- `run_subagent(prompt)`: схема есть в `tools.SCHEMAS`, но функции в `TOOLS` нет. `Agent._execute` перехватывает вызов (как `run_bash`), потому что нужен доступ к `LLM`, а `tools.py` его не знает. Создаётся `Agent(read_only=True)` с пустой историей, тем же `LLM`, `CLAUDE.md` без навыков и хуков, лимитом `SUBAGENT_MAX_STEPS`=12 и логом `<лог родителя>-subagents/subNN.jsonl`. Родитель получает `{ok: true, result: итоговый текст}` либо `{ok: false, error}`, если субагент не закончил (`Agent.outcome` != `done`). `outcome == cancelled` (Ctrl+C) пробрасывается как `KeyboardInterrupt`, и родитель закрывает ход обычным путём. Рекурсии нет: у `read_only`-агента `run_subagent` не входит в разрешённые инструменты. В режиме плана `run_subagent` тоже скрыт.
+- `run_subagent(prompt, write?, background?)` и `get_subagent_result(id, wait?)`: схемы есть в `tools.SCHEMAS`, функций в `TOOLS` нет. `Agent._execute` перехватывает вызовы (как `run_bash`), потому что нужен доступ к `LLM`. Создаётся `Agent(read_only=True, can_write=write)` с пустой историей, тем же `LLM`, `CLAUDE.md` без навыков и хуков, лимитом `SUBAGENT_MAX_STEPS`=12 (с `write=true`: `SUBAGENT_WRITE_MAX_STEPS`=25, но не больше `max_steps` родителя) и логом `<лог родителя>-subagents/subNN.jsonl`. Доступные инструменты субагента: `READ_ONLY_TOOLS`, при `can_write` ещё `WRITE_TOOLS` (`write_file`, `edit_file`; `run_bash` никогда). Подтверждения как у родителя (`auto_yes` наследуется); `background` + `write` без `--yes` отклоняется ошибкой, потому что `input()` из потока перебил бы REPL. Рекурсии нет. `Agent.changed` копит пути успешных `write_file`/`edit_file`; у `write`-субагента результат содержит `changed_files`, а при незавершении ошибка перечисляет их (родитель не должен править вслепую то, что субагент уже изменил).
+- **Реестр** `Agent.subruns: {id: SubRun}` (`SubRun.status`: running / done / failed / cancelled). Передний план: `_work` выполняется inline, вывод через `ui.Nested` (строки `↳ #N`), родитель получает `{ok, status, id, result}` или `{ok: false, error}`. Фон: `threading.Thread(daemon=True)`, вывод через `ui.Quiet` (из потока ничего не печатается, всё идёт в лог), вызов возвращает `{ok, id, status: running}`; итог забирает `get_subagent_result` (по умолчанию ждёт короткими `join(0.2)`, чтобы Ctrl+C работал). О завершении фонового субагента пользователю сообщает `_report_finished` в начале шага родителя.
+- **Отмена.** Ctrl+C у родителя вызывает `_cancel_subagents`: у фоновых выставляется `Agent._cancel`, и на ближайшем шаге их цикл бросает `KeyboardInterrupt` (итог `cancelled`). Переднему субагенту `cancelled` пробрасывается как `KeyboardInterrupt`.
+- **Просмотр.** `/agents` (`Agent.list_subagents`) и `/agent N` (`Agent.show_subagent`): перечитывают JSONL-лог субагента и печатают события `model`/`tool` через `ui`. Реестр живёт только в текущей сессии (после `--resume` пуст; логи на диске остаются). В режиме плана оба инструмента скрыты.
 
 ## Вложения в задаче
 

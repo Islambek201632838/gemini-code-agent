@@ -386,12 +386,26 @@ SCHEMAS = [
     {
         # Выполняется в agent.py (нужен доступ к LLM), поэтому в TOOLS этой функции нет.
         "name": "run_subagent",
-        "description": "Delegate a self-contained READ-ONLY investigation (e.g. 'find where X is handled and "
-                       "summarize how it works') to a fresh subagent with its own empty context. It can only use "
-                       "read_file/glob/grep and returns only a short summary, so large exploration does not fill "
-                       "your context. Put everything it needs to know into the prompt: it cannot see this conversation.",
+        "description": "Delegate a self-contained task to a fresh subagent with its own empty context. By default it is "
+                       "READ-ONLY (read_file/glob/grep): use it for investigations such as 'find where X is handled and "
+                       "summarize how it works'. Set write=true to also allow write_file/edit_file (no shell) for a "
+                       "self-contained change. It returns only a short summary, so large exploration does not fill your "
+                       "context. Put everything it needs into the prompt: it cannot see this conversation. "
+                       "Set background=true to start it and continue immediately; to run several subagents in parallel, "
+                       "start each with background=true, then collect each answer with get_subagent_result.",
         "parameters": {"type": "object", "properties": {
             "prompt": {"type": "string", "description": "Complete, self-contained task for the subagent."},
+            "write": {"type": "boolean", "description": "Allow write_file/edit_file (default false)."},
+            "background": {"type": "boolean", "description": "Return immediately with an id (default false)."},
         }, "required": ["prompt"]},
+    },
+    {
+        "name": "get_subagent_result",
+        "description": "Get the final answer of a subagent started with background=true. By default waits until it "
+                       "finishes; with wait=false returns its status ('running' or the result) without waiting.",
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "integer", "description": "The id returned by run_subagent."},
+            "wait": {"type": "boolean", "description": "Wait for completion (default true)."},
+        }, "required": ["id"]},
     },
 ]

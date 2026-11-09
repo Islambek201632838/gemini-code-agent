@@ -3,6 +3,7 @@
 Фейковая модель общая у родителя и субагента: ответы берутся из одной очереди по порядку обращений.
 """
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -136,7 +137,7 @@ class TestSubagent(ModeTestCase):
         ])
         self.assertEqual(a.run("task"), "final")
         result = a.history[2]["results"][0][1]
-        self.assertEqual(result, {"ok": True, "result": "a.txt says hello"})
+        self.assertEqual(result, {"ok": True, "status": "done", "id": 1, "result": "a.txt says hello"})
         self.assertEqual(len(a.history), 4)                    # внутренности субагента в историю не попали
         self.assert_valid_history(a.history)
         sub_call = self.llm.calls[1]                           # первый запрос субагента
@@ -182,6 +183,130 @@ class TestSubagent(ModeTestCase):
         a.set_plan_mode(True)
         a.run("task")
         self.assertNotIn("run_subagent", self.llm.calls[0]["tools"])
+
+
+def agent_mod_limits():
+    import agent as m
+    return m.SUBAGENT_MAX_STEPS, min(25, m.SUBAGENT_WRITE_MAX_STEPS)
+
+
+class SplitLLM(RecordingLLM):
+    """Ответы родителю и субагенту из разных очередей (в фоне порядок обращений не детерминирован)."""
+
+    def __init__(self, parent, sub):
+        super().__init__([])
+        self.parent_q, self.sub_q, self.lock = list(parent), list(sub), threading.Lock()
+
+    def generate(self, history, system, schemas):
+        with self.lock:
+            self.replies = self.sub_q if "subagent" in system else self.parent_q
+            return super().generate(history, system, schemas)
+
+
+class TestSubagentExtras(ModeTestCase):
+    def make_split(self, parent, sub, **kw):
+        import agent as agent_mod
+        self.llm = SplitLLM(parent, sub)
+        return agent_mod.Agent(self.llm, self.ws, auto_yes=kw.pop("auto_yes", True), log_dir=self.dir / "logs", **kw)
+
+    def test_write_subagent_can_write_but_not_bash(self):
+        a = self.make_split(
+            [call_reply("run_subagent", prompt="make x", write=True), text_reply("final")],
+            [call_reply("write_file", path="x.txt", content="hi"), text_reply("wrote x.txt")])
+        a.run("task")
+        self.assertEqual((self.ws / "x.txt").read_text(), "hi")
+        sub_tools = set(self.llm.calls[1]["tools"])
+        self.assertEqual(sub_tools, tools.READ_ONLY_TOOLS | {"write_file", "edit_file"})
+        self.assertNotIn("run_bash", sub_tools)
+
+    def test_write_subagent_reports_changed_files_and_has_more_steps(self):
+        a = self.make_split(
+            [call_reply("run_subagent", prompt="make x", write=True), text_reply("final")],
+            [call_reply("write_file", path="x.txt", content="hi")] + [call_reply("read_file", path="a.txt")] * 3
+            + [text_reply("done")])
+        a.run("task")
+        res = a.history[2]["results"][0][1]
+        self.assertEqual(res["changed_files"], ["x.txt"])
+        self.assertEqual(a.subruns[1].agent.max_steps, agent_mod_limits()[1])
+
+    def test_failed_write_subagent_lists_changed_files(self):
+        a = self.make_split(
+            [call_reply("run_subagent", prompt="make x", write=True), text_reply("final")],
+            [call_reply("write_file", path="x.txt", content="hi"), RuntimeError("boom")])
+        a.run("task")
+        res = a.history[2]["results"][0][1]
+        self.assertFalse(res["ok"])
+        self.assertIn("x.txt", res["error"])
+
+    def test_write_subagent_asks_confirmation(self):
+        import builtins
+        a = self.make_split(
+            [call_reply("run_subagent", prompt="make x", write=True), text_reply("final")],
+            [call_reply("write_file", path="x.txt", content="hi"), text_reply("denied")], auto_yes=False)
+        real, builtins.input = builtins.input, lambda *_: "n"
+        try:
+            a.run("task")
+        finally:
+            builtins.input = real
+        self.assertFalse((self.ws / "x.txt").exists())
+
+    def test_background_write_without_yes_is_refused(self):
+        a = self.make_split([call_reply("run_subagent", prompt="x", write=True, background=True), text_reply("f")],
+                            [], auto_yes=False)
+        a.run("task")
+        self.assertIn("cannot ask", a.history[2]["results"][0][1]["error"])
+
+    def test_background_subagent_and_get_result(self):
+        a = self.make_split(
+            [call_reply("run_subagent", prompt="one", background=True),
+             call_reply("get_subagent_result", id=1),
+             text_reply("final")],
+            [call_reply("read_file", path="a.txt"), text_reply("bg answer")])
+        self.assertEqual(a.run("task"), "final")
+        started = a.history[2]["results"][0][1]
+        self.assertEqual((started["ok"], started["id"]), (True, 1))
+        self.assertEqual(a.history[4]["results"][0][1]["result"], "bg answer")
+        self.assert_valid_history(a.history)
+
+    def test_get_result_unknown_id(self):
+        a = self.make_split([call_reply("get_subagent_result", id=7), text_reply("f")], [])
+        a.run("task")
+        self.assertIn("unknown subagent id", a.history[2]["results"][0][1]["error"])
+
+    def test_show_subagent_replays_log(self):
+        import contextlib
+        import io
+        a = self.make_split(
+            [call_reply("run_subagent", prompt="look"), text_reply("final")],
+            [call_reply("read_file", path="a.txt"), text_reply("seen")])
+        a.run("task")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            commands.handle(a, "/agents")
+            commands.handle(a, "/agent 1")
+        text = out.getvalue()
+        self.assertIn("#1 [done]", text)
+        self.assertIn("read_file", text)
+        self.assertIn("seen", text)
+
+    def test_parent_ctrl_c_cancels_background_subagent(self):
+        gate = threading.Event()
+
+        class Blocking(SplitLLM):
+            def generate(self, history, system, schemas):
+                if "subagent" in system:
+                    gate.wait(5)  # субагент «думает», пока родитель получает Ctrl+C
+                    return call_reply("read_file", path="a.txt")
+                return super().generate(history, system, schemas)
+
+        import agent as agent_mod
+        self.llm = Blocking([call_reply("run_subagent", prompt="x", background=True), KeyboardInterrupt()], [])
+        a = agent_mod.Agent(self.llm, self.ws, auto_yes=True, log_dir=self.dir / "logs")
+        a.run("task")
+        run = a.subruns[1]
+        gate.set()
+        run.thread.join(5)
+        self.assertEqual(run.status, "cancelled")
 
 
 if __name__ == "__main__":

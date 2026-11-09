@@ -207,3 +207,35 @@ def confirm_request(name: str, args: dict) -> str:
     else:
         print(_indent(json.dumps(args, ensure_ascii=False, indent=2)))
     return "  Одобрить? [y/N] "
+
+
+# ---------------------------------------------------------------- вывод субагентов
+
+class Quiet:
+    """Вывод фонового субагента: молчит (из потока печатать нельзя, перебьёт ввод пользователя).
+
+    Всё, что делает субагент, пишется в его JSONL-лог; смотреть: /agent N.
+    """
+
+    def __getattr__(self, name):
+        return lambda *a, **kw: None
+
+
+class Nested(Quiet):
+    """Вывод субагента в переднем плане: только вызовы инструментов и краткие итоги, с отступом и меткой #N."""
+
+    def __init__(self, n: int):
+        self.n = n
+
+    def tool_call(self, name: str, args: dict) -> None:
+        print(_c(f"    ↳ #{self.n} ", DIM) + _c(name, BOLD) + _c(f"({_short(_args_summary(name, args), 70)})", DIM))
+
+    def tool_result(self, result: dict, streamed: bool = False) -> None:
+        if not result.get("ok", False) and "error" in result:
+            print("      " + _c("⎿ ✗ " + _short(str(result["error"]), 90), RED))
+
+    def confirm_request(self, name: str, args: dict) -> str:  # запись в переднем плане подтверждает пользователь
+        return confirm_request(name, args)
+
+    def error(self, message: str) -> None:
+        error(message)
